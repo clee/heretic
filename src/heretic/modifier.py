@@ -87,6 +87,18 @@ class Modifier(Plugin, ABC, Generic[Parameters]):
         undoing any changes made by `modify_model`.
         """
 
+    def bake(
+        self,
+        ctx: Context,
+        merged_model: Any,
+        parameters: Parameters,
+    ) -> None:
+        """
+        Bake changes that cannot be represented as LoRA adapters into
+        `merged_model` before it is saved. The default implementation does
+        nothing.
+        """
+
     def render_trial_parameters(self, trial: Trial | FrozenTrial) -> dict[str, str]:
         """
         Transform the names and values of the modifier's parameters

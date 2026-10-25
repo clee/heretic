@@ -307,43 +307,55 @@ class Abliteration(Modifier[Parameters]):
             weight_distributions=weight_distributions,
         )
 
+    def _layer_weight(
+        self,
+        distribution: WeightDistribution,
+        layer_index: int,
+    ) -> float:
+        distance = abs(layer_index - distribution.max_weight_position)
+
+        # Don't ablate layers that are more than
+        # min_weight_distance away from max_weight_position.
+        if distance > distribution.min_weight_distance:
+            return 0.0
+
+        # Interpolate linearly between max_weight and min_weight
+        # over min_weight_distance.
+        return distribution.max_weight + (
+            distance / distribution.min_weight_distance
+        ) * (distribution.min_weight - distribution.max_weight)
+
+    def _layer_direction(
+        self,
+        parameters: Parameters,
+        layer_index: int,
+    ) -> Tensor:
+        # The index must be shifted by 1 because the first element
+        # of residual_directions is the direction for the embeddings.
+        if parameters.direction_index is None:
+            return self.residual_directions[layer_index + 1]
+
+        fraction, index = math.modf(parameters.direction_index + 1)
+        return F.normalize(
+            self.residual_directions[int(index)].lerp(
+                self.residual_directions[int(index) + 1],
+                fraction,
+            ),
+            p=2,
+            dim=0,
+        )
+
     def modify_model(self, ctx: Context, parameters: Parameters) -> None:
         model = ctx.get_model()
-
-        if parameters.direction_index is None:
-            residual_direction = None
-        else:
-            # The index must be shifted by 1 because the first element
-            # of residual_directions is the direction for the embeddings.
-            weight, index = math.modf(parameters.direction_index + 1)
-            residual_direction = F.normalize(
-                self.residual_directions[int(index)].lerp(
-                    self.residual_directions[int(index) + 1],
-                    weight,
-                ),
-                p=2,
-                dim=0,
-            )
 
         # Note that some implementations of abliteration also orthogonalize
         # the embedding matrix, but it's unclear if that has any benefits.
         for layer_index in range(len(model.get_layers())):
             for component, modules in model.get_layer_modules(layer_index).items():
-                weight_distribution = parameters.weight_distributions[component]
-
-                # Type inference fails here for some reason.
-                distance = abs(layer_index - weight_distribution.max_weight_position)
-
-                # Don't orthogonalize layers that are more than
-                # min_weight_distance away from max_weight_position.
-                if distance > weight_distribution.min_weight_distance:
-                    continue
-
-                # Interpolate linearly between max_weight and min_weight
-                # over min_weight_distance.
-                weight = weight_distribution.max_weight + (
-                    distance / weight_distribution.min_weight_distance
-                ) * (weight_distribution.min_weight - weight_distribution.max_weight)
+                weight = self._layer_weight(
+                    parameters.weight_distributions[component],
+                    layer_index,
+                )
 
                 # A weight of 0 disables this component's ablation. reset_model() has
                 # already left the adapter at identity, so abort before the otherwise
@@ -351,12 +363,10 @@ class Abliteration(Modifier[Parameters]):
                 if weight == 0:
                     continue
 
-                if residual_direction is None:
-                    # The index must be shifted by 1 because the first element
-                    # of residual_directions is the direction for the embeddings.
-                    layer_residual_direction = self.residual_directions[layer_index + 1]
-                else:
-                    layer_residual_direction = residual_direction
+                layer_residual_direction = self._layer_direction(
+                    parameters,
+                    layer_index,
+                )
 
                 for module in modules:
                     # FIXME: This cast is potentially invalid, because the program logic
@@ -458,6 +468,39 @@ class Abliteration(Modifier[Parameters]):
                     weight_B = cast(Tensor, module.lora_B["default"].weight)
                     weight_A.data = lora_A.to(weight_A.dtype)
                     weight_B.data = lora_B.to(weight_B.dtype)
+
+    def bake(
+        self,
+        ctx: Context,
+        merged_model: Any,
+        parameters: Parameters,
+    ) -> None:
+        """Bake the MLP ablation into fused routed-expert weights."""
+        if not hasattr(self, "residual_directions"):
+            return
+
+        distribution = parameters.weight_distributions.get("mlp.down_proj")
+        if distribution is None:
+            return
+
+        baked = 0
+        for layer_index, layer in enumerate(ctx.get_model().get_layers()):
+            weight = self._layer_weight(distribution, layer_index)
+            experts = getattr(getattr(layer, "mlp", None), "experts", None)
+            down_proj = getattr(experts, "down_proj", None)
+            if weight == 0 or not isinstance(down_proj, Tensor) or down_proj.ndim != 3:
+                continue
+
+            direction = self._layer_direction(parameters, layer_index)
+            v = direction.to(device=down_proj.device, dtype=torch.float32)
+            with torch.no_grad():
+                for matrix in down_proj:
+                    matrix -= (weight * torch.outer(v, v @ matrix.float())).to(
+                        down_proj.dtype
+                    )
+            baked += len(down_proj)
+
+        print(f"* Baked {baked} routed expert down projections")
 
     def reset_model(self, ctx: Context) -> None:
         model = ctx.get_model()
